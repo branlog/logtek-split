@@ -1,4 +1,21 @@
 // server.js — Express sur Render (Logtek Split)
+import express from "express";
+import fetch from "node-fetch"; // pour les requêtes API
+import crypto from "crypto"; // version compatible Node 24
+
+const app = express();
+
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Variables d'environnement
+const SHOP = process.env.SHOPIFY_SHOP_DOMAIN;
+const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;
+const APP_PROXY_SECRET = process.env.APP_PROXY_SECRET;
+const PORT = process.env.PORT || 10000;
+// server.js — Express sur Render (Logtek Split)
 import express from 'express';
 import crypto from 'crypto';
 import fetch from 'node-fetch';
