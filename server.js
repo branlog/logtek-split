@@ -1,7 +1,7 @@
 // server.js — Express sur Render (Logtek Split)
 import express from 'express';
 import crypto from 'crypto';
-
+import fetch from 'node-fetch';
 const app = express();
 
 // Shopify envoie les requêtes App Proxy en x-www-form-urlencoded (GET) ou JSON (via fetch côté vitrine).
