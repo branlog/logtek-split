@@ -3,7 +3,8 @@
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
-console.log("Logtek split — HMAC v5 loaded");
+console.log("Logtek split — HMAC v6 loaded");
+
 
 
 
@@ -40,12 +41,12 @@ const escapeHtml = (s) =>
 // ====== HMAC App Proxy — variantes encodées & RAW triées ======================
 // ===== HMAC App Proxy — v4 (encoded/raw + express path + PROXY path) =========
 // ===== HMAC App Proxy — v5 (encoded, rawSorted, rawOriginal, proxy path) ======
+// ===== HMAC App Proxy — v6 (encoded, rawSorted, rawOriginal, proxy path, prefix-only, legacy md5) =====
 function safeHmacEq(a, b) {
   try { return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")); }
   catch { return false; }
 }
 
-// Encodée + triée (classique)
 function canonicalEncoded(paramsObj) {
   const pairs = [];
   for (const [k, v] of paramsObj.entries()) pairs.push([k, v]);
@@ -53,7 +54,7 @@ function canonicalEncoded(paramsObj) {
   return pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
 }
 
-// RAW + triée (on conserve les fragments bruts, mais on trie)
+// RAW + triée
 function canonicalRawSorted(queryString) {
   if (!queryString) return "";
   const segs = queryString.split("&").filter(Boolean).map(seg => {
@@ -67,10 +68,10 @@ function canonicalRawSorted(queryString) {
   return segs.map(p => p.raw).join("&");
 }
 
-// RAW + ordre d'origine (AUCUN tri, on enlève juste hmac/signature et on garde l'ordre exact)
+// RAW + ordre d’origine (sans tri)
 function rawOriginalWithoutSig(queryString) {
   if (!queryString) return "";
-  const parts = [];
+  const out = [];
   for (const seg of queryString.split("&")) {
     if (!seg) continue;
     const i = seg.indexOf("=");
@@ -78,55 +79,110 @@ function rawOriginalWithoutSig(queryString) {
     let kDec;
     try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
     if (kDec === "hmac" || kDec === "signature") continue;
-    parts.push(seg); // on conserve tel quel (encodage/ordre d'origine)
+    out.push(seg);
   }
-  return parts.join("&");
+  return out.join("&");
+}
+
+// Variante: RAW d’origine mais en retirant path_prefix (au cas où Shopify ne le signe pas)
+function rawOriginalMinusPathPrefix(queryString) {
+  if (!queryString) return "";
+  const out = [];
+  for (const seg of queryString.split("&")) {
+    if (!seg) continue;
+    const i = seg.indexOf("=");
+    const kRaw = i >= 0 ? seg.slice(0, i) : seg;
+    let kDec;
+    try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
+    if (kDec === "hmac" || kDec === "signature" || kDec === "path_prefix") continue;
+    out.push(seg);
+  }
+  return out.join("&");
 }
 
 function verifyProxySignature(req) {
-  const full     = req.originalUrl || "";               // ex: "/prepare?shop=...&hmac=..."
+  const full     = req.originalUrl || "";
   const rawPath  = full.split("?")[0] || "";
   const qStr     = full.includes("?") ? full.split("?")[1] : "";
 
   const urlParams = new URLSearchParams(qStr);
-  const provided  = urlParams.get("hmac") || urlParams.get("signature");
-  if (!provided) { console.log("[Proxy v5] aucun hmac/signature"); return false; }
+  const providedHmac = urlParams.get("hmac");
+  const providedSig  = urlParams.get("signature"); // legacy
+  const provided     = providedHmac || providedSig;
+  if (!provided) { console.log("[Proxy v6] aucun hmac/signature"); return false; }
 
-  // Prépare les 3 variantes de base de la query
+  // Prépare les variantes de query
   const encQ   = (() => { const p = new URLSearchParams(qStr); p.delete("hmac"); p.delete("signature"); return canonicalEncoded(p); })();
   const rawQ   = canonicalRawSorted(qStr);
   const rawOri = rawOriginalWithoutSig(qStr);
+  const rawOriNoPrefix = rawOriginalMinusPathPrefix(qStr);
 
-  // Chemins candidats : express et proxy complet
-  const expressPath = req.path || rawPath || "/prepare";                // "/prepare"
-  const proxyPath   = `/apps/logtek-split${expressPath}`;               // "/apps/logtek-split/prepare"
+  // Chemins
+  const expressPath   = req.path || rawPath || "/prepare";             // "/prepare"
+  const proxyPrefix   = "/apps";
+  const proxySub      = "/logtek-split";
+  const proxyPath     = `${proxyPrefix}${proxySub}${expressPath}`;     // "/apps/logtek-split/prepare"
+  const proxyRootPath = `${proxyPrefix}${proxySub}`;                   // "/apps/logtek-split"
 
   const show = (s) => (s || "").toString().slice(0, 140);
 
-  const candidates = [
-    { label: "encoded:query",             data: encQ },
-    { label: "encoded:path(express)",     data: encQ   ? `${expressPath}?${encQ}` : expressPath },
-    { label: "encoded:path(proxy)",       data: encQ   ? `${proxyPath}?${encQ}`   : proxyPath },
-    { label: "rawSorted:query",           data: rawQ },
-    { label: "rawSorted:path(express)",   data: rawQ   ? `${expressPath}?${rawQ}` : expressPath },
-    { label: "rawSorted:path(proxy)",     data: rawQ   ? `${proxyPath}?${rawQ}`   : proxyPath },
-    { label: "rawOriginal:query",         data: rawOri },
-    { label: "rawOriginal:path(proxy)",   data: rawOri ? `${proxyPath}?${rawOri}` : proxyPath },
+  console.log(`[Proxy v6] expressPath="${expressPath}" proxyPath="${proxyPath}" rawPath="${rawPath}" used="${providedHmac ? 'hmac' : 'signature'}"`);
+  console.log(`[Proxy v6] encQ="${show(encQ)}"`);
+  console.log(`[Proxy v6] rawQ="${show(rawQ)}"`);
+  console.log(`[Proxy v6] rawOri="${show(rawOri)}" rawOriNoPrefix="${show(rawOriNoPrefix)}"`);
+
+  // Candidats HMAC-SHA256 (nouveau format)
+  const hmacCandidates = [
+    // query seule
+    { label: "H256 encoded:query",              data: encQ },
+    { label: "H256 rawSorted:query",            data: rawQ },
+    { label: "H256 rawOriginal:query",          data: rawOri },
+    { label: "H256 rawOriginalNoPrefix:query",  data: rawOriNoPrefix },
+
+    // path express
+    { label: "H256 encoded:path(express)",      data: encQ   ? `${expressPath}?${encQ}`     : expressPath },
+    { label: "H256 rawSorted:path(express)",    data: rawQ   ? `${expressPath}?${rawQ}`     : expressPath },
+    { label: "H256 rawOriginal:path(express)",  data: rawOri ? `${expressPath}?${rawOri}`   : expressPath },
+    { label: "H256 rawOriginalNoPrefix:path(express)", data: rawOriNoPrefix ? `${expressPath}?${rawOriNoPrefix}` : expressPath },
+
+    // path proxy COMPLET
+    { label: "H256 encoded:path(proxy)",        data: encQ   ? `${proxyPath}?${encQ}`       : proxyPath },
+    { label: "H256 rawSorted:path(proxy)",      data: rawQ   ? `${proxyPath}?${rawQ}`       : proxyPath },
+    { label: "H256 rawOriginal:path(proxy)",    data: rawOri ? `${proxyPath}?${rawOri}`     : proxyPath },
+    { label: "H256 rawOriginalNoPrefix:path(proxy)", data: rawOriNoPrefix ? `${proxyPath}?${rawOriNoPrefix}` : proxyPath },
+
+    // path proxy **racine** (sans /prepare) — certains thèmes signent ça
+    { label: "H256 encoded:path(proxyRoot)",        data: encQ   ? `${proxyRootPath}?${encQ}`       : proxyRootPath },
+    { label: "H256 rawOriginal:path(proxyRoot)",    data: rawOri ? `${proxyRootPath}?${rawOri}`     : proxyRootPath },
+    { label: "H256 rawOriginalNoPrefix:path(proxyRoot)", data: rawOriNoPrefix ? `${proxyRootPath}?${rawOriNoPrefix}` : proxyRootPath },
   ];
 
-  console.log(`[Proxy v5] expressPath="${expressPath}" proxyPath="${proxyPath}" rawPath="${rawPath}"`);
-  console.log(`[Proxy v5] encQ="${show(encQ)}"`);
-  console.log(`[Proxy v5] rawQ="${show(rawQ)}"`);
-  console.log(`[Proxy v5] rawOri="${show(rawOri)}"`);
-
-  for (const v of candidates) {
+  for (const v of hmacCandidates) {
     const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(v.data).digest("hex");
     const ok = safeHmacEq(digest, provided);
-    console.log(`[Proxy v5] try=${v.label} | base="${show(v.data)}" | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${ok}`);
+    console.log(`[Proxy v6] try=${v.label} | base="${show(v.data)}" | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${ok}`);
     if (ok) return true;
   }
+
+  // Fallback LEGACY MD5 si Shopify envoie encore "signature" (très rare, mais on couvre)
+  if (providedSig && !providedHmac) {
+    const md5Candidates = [
+      `${rawOri}`, `${encQ}`,
+      `${expressPath}?${rawOri}`, `${expressPath}?${encQ}`,
+      `${proxyPath}?${rawOri}`,   `${proxyPath}?${encQ}`,
+      `${proxyRootPath}?${rawOri}`, `${proxyRootPath}?${encQ}`,
+    ].filter(Boolean);
+    for (const base of md5Candidates) {
+      const digest = crypto.createHash("md5").update(APP_PROXY_SECRET + base).digest("hex");
+      const ok = safeHmacEq(digest, providedSig);
+      console.log(`[Proxy v6] LEGACY md5 | base="${show(base)}" | digest8=${digest.slice(0,8)} | prov8=${providedSig.slice(0,8)} | ok=${ok}`);
+      if (ok) return true;
+    }
+  }
+
   return false;
 }
+
 
 
 // ==============================================================================
