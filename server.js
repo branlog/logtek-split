@@ -1,39 +1,40 @@
-// server.js — Logtek Split (Express + Shopify Proxy) — Compatible Render/Node 18+
-// ----------------------------------------------------------
+// server.js — Logtek Split (Express + Shopify App Proxy) — Compatible Render/Node 18+
+// -----------------------------------------------------------------------------
 import express from "express";
-import fetch from "node-fetch";           // Requêtes HTTP côté Node
-import crypto from "crypto";              // HMAC vérification App Proxy
+import fetch from "node-fetch";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ---- ENV --------------------------------------------------
-const SHOP = process.env.SHOPIFY_SHOP_DOMAIN;           // ex: logtek-ci.myshopify.com
-const ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;    // Admin API token (app custom)
-const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN; // Storefront token
-const APP_PROXY_SECRET = process.env.APP_PROXY_SECRET;  // Shared secret App Proxy
-const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";   // (optionnel)
-const FROM_EMAIL = process.env.FROM_EMAIL || "no-reply@logtek.ca"; // (optionnel)
-const PORT = process.env.PORT || 10000;
+// ===== ENV ====================================================================
+const SHOP                = process.env.SHOPIFY_SHOP_DOMAIN;            // ex: 2uvcbu-ci.myshopify.com
+const ADMIN_TOKEN         = process.env.SHOPIFY_ADMIN_TOKEN;            // Admin API token
+const STOREFRONT_TOKEN    = process.env.SHOPIFY_STOREFRONT_TOKEN;       // Storefront token
+const APP_PROXY_SECRET    = process.env.APP_PROXY_SECRET;               // Partner dashboard → Settings → Secret
+const SENDGRID_API_KEY    = process.env.SENDGRID_API_KEY || "";         // optionnel
+const FROM_EMAIL          = process.env.FROM_EMAIL || "no-reply@logtek.ca";
+const PORT                = process.env.PORT || 10000;
 
 if (!SHOP || !ADMIN_TOKEN) {
   console.warn("[WARN] SHOPIFY_SHOP_DOMAIN ou SHOPIFY_ADMIN_TOKEN manquant(s).");
 }
 
-// ---- Fournisseurs (simple table au départ) ----------------
+// ===== Fournisseurs (exemple) =================================================
 const VENDORS = [
-  { vendor_id: "centre-routier",  name: "Le Centre Routier",  po_email: "commandes@centreroutier.ca" },
-  { vendor_id: "carrefour-camion",name: "Carrefour du Camion",po_email: "achat@carrefourcamion.ca" },
-  { vendor_id: "flextral",        name: "Hose Flextral",      po_email: "orders@flextral.ca" }
+  { vendor_id: "centre-routier",   name: "Le Centre Routier",   po_email: "commandes@centreroutier.ca" },
+  { vendor_id: "carrefour-camion", name: "Carrefour du Camion", po_email: "achat@carrefourcamion.ca" },
+  { vendor_id: "flextral",         name: "Hose Flextral",       po_email: "orders@flextral.ca" }
 ];
 
-// ---- Utils ------------------------------------------------
+// ===== Utils ==================================================================
 const escapeHtml = (s) =>
   (s || "").toString().replace(/[&<>"']/g, (m) => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[m]));
 
+// HMAC check pour App Proxy
 function verifyProxyHmac(queryString) {
   try {
     const params = new URLSearchParams(queryString || "");
@@ -41,11 +42,13 @@ function verifyProxyHmac(queryString) {
     params.delete("hmac");
     const raw = params.toString();
     const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(raw).digest("hex");
-    return (
-      hmac &&
-      crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"))
-    );
-  } catch {
+
+    // --- DEBUG SAFE (8 premiers caractères) ---
+    console.log("[Proxy HMAC] hasHmac:", !!hmac, "| digest8:", digest.slice(0,8), "| hmac8:", (hmac||"").slice(0,8));
+
+    return hmac && crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
+  } catch (e) {
+    console.error("verifyProxyHmac error:", e);
     return false;
   }
 }
@@ -55,9 +58,9 @@ async function adminGraphQL(query, variables) {
     method: "POST",
     headers: {
       "X-Shopify-Access-Token": ADMIN_TOKEN,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   });
   return r.json();
 }
@@ -82,7 +85,7 @@ async function fetchProductsMetafields(productIds) {
     const pid = Number(n.id.split("/").pop());
     out.set(pid, {
       account_eligible: n?.m1?.value || "false",
-      vendor_id: n?.m2?.value || null
+      vendor_id: n?.m2?.value || null,
     });
   }
   return out;
@@ -117,16 +120,13 @@ function splitByVendorAndTerms(lines, vendorMap) {
     }
   }
   const onAccountGroups = Array.from(groups.entries()).map(([vendorId, lines]) => ({
-    vendorId, lines, account: vendorMap.get(vendorId) || null
+    vendorId, lines, account: vendorMap.get(vendorId) || null,
   }));
   return { onAccountGroups, payNowLines: payNow };
 }
 
 async function createDraftOrderOnAccount(group, customerId) {
-  const line_items = group.lines.map((l) => ({
-    variant_id: l.variantId,
-    quantity: l.quantity
-  }));
+  const line_items = group.lines.map((l) => ({ variant_id: l.variantId, quantity: l.quantity }));
   const payload = {
     draft_order: {
       line_items,
@@ -135,18 +135,15 @@ async function createDraftOrderOnAccount(group, customerId) {
       note_attributes: [
         { name: "Vendor", value: group.vendorId },
         { name: "Account No", value: group.account?.account_no || "" },
-        { name: "Type", value: "Au compte" }
+        { name: "Type", value: "Au compte" },
       ],
-      use_customer_default_address: true
-    }
+      use_customer_default_address: true,
+    },
   };
   const resp = await fetch(`https://${SHOP}/admin/api/2025-01/draft_orders.json`, {
     method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": ADMIN_TOKEN,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(payload)
+    headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
   }).then((x) => x.json());
   return resp?.draft_order || null;
 }
@@ -154,7 +151,7 @@ async function createDraftOrderOnAccount(group, customerId) {
 async function createPayNowCheckout(payNowLines) {
   const lineItems = payNowLines.map((l) => ({
     quantity: l.quantity,
-    variantId: `gid://shopify/ProductVariant/${l.variantId}`
+    variantId: `gid://shopify/ProductVariant/${l.variantId}`,
   }));
   const query = `
     mutation checkoutCreate($input: CheckoutCreateInput!){
@@ -168,9 +165,9 @@ async function createPayNowCheckout(payNowLines) {
     method: "POST",
     headers: {
       "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
-    body: JSON.stringify({ query, variables })
+    body: JSON.stringify({ query, variables }),
   }).then((x) => x.json());
   if (r?.data?.checkoutCreate?.userErrors?.length) {
     console.error("Storefront checkoutCreate errors:", r.data.checkoutCreate.userErrors);
@@ -179,13 +176,15 @@ async function createPayNowCheckout(payNowLines) {
 }
 
 function buildPOHtml({ vendor, account, draftOrder }) {
-  const rows = (draftOrder?.line_items || []).map((li) => {
-    const sku = li?.sku || li?.variant_id || "";
-    const title = li?.title || "";
-    const qty = li?.quantity || 1;
-    const total = li?.original_total || "";
-    return `<tr><td>${escapeHtml(sku)}</td><td>${escapeHtml(title)}</td><td>${qty}</td><td class="right">${escapeHtml(total?.toString()||"")}</td></tr>`;
-  }).join("\n");
+  const rows = (draftOrder?.line_items || [])
+    .map((li) => {
+      const sku = li?.sku || li?.variant_id || "";
+      const title = li?.title || "";
+      const qty = li?.quantity || 1;
+      const total = li?.original_total || "";
+      return `<tr><td>${escapeHtml(sku)}</td><td>${escapeHtml(title)}</td><td>${qty}</td><td class="right">${escapeHtml(total?.toString()||"")}</td></tr>`;
+    })
+    .join("\n");
 
   return `<!doctype html><html><head><meta charset="utf-8">
   <style>
@@ -211,28 +210,28 @@ function buildPOHtml({ vendor, account, draftOrder }) {
 }
 
 async function sendEmail({ to, subject, html }) {
-  if (!to || !SENDGRID_API_KEY) return; // Pas de clé = on n'envoie pas (safe)
+  if (!to || !SENDGRID_API_KEY) return;
   const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${SENDGRID_API_KEY}`,
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
     },
     body: JSON.stringify({
       personalizations: [{ to: [{ email: to }] }],
       from: { email: FROM_EMAIL, name: "LOGTEK" },
       subject,
-      content: [{ type: "text/html", value: html }]
-    })
+      content: [{ type: "text/html", value: html }],
+    }),
   });
   if (!r.ok) console.error("Sendgrid error", await r.text());
 }
 
-// ---- Routes -----------------------------------------------
-
+// ===== Routes =================================================================
 // Healthcheck Render
 app.get("/health", (_req, res) => res.status(200).send("ok"));
-// Test GET via App Proxy (pour vérif rapide dans le navigateur)
+
+// GET /prepare — pour test rapide au navigateur via App Proxy
 app.get("/prepare", (req, res) => {
   const query = (req.originalUrl.split("?")[1]) || "";
   if (!verifyProxyHmac(query)) {
@@ -241,10 +240,13 @@ app.get("/prepare", (req, res) => {
   return res.status(200).json({ error: "Panier vide" });
 });
 
-// App Proxy target: Shopify appellera /apps/logtek-split/prepare => proxifié ici en /prepare?...&hmac=...
+// POST /prepare — route utilisée par le bouton “Payer (split)” côté thème
 app.post("/prepare", async (req, res) => {
   try {
-    
+    const query = (req.originalUrl.split("?")[1]) || "";
+    if (!verifyProxyHmac(query)) {
+      return res.status(401).json({ error: "Invalid proxy signature" });
+    }
 
     const { customerId, items } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
@@ -252,35 +254,34 @@ app.post("/prepare", async (req, res) => {
     }
 
     // 1) Metafields produits
-    const productIds = [...new Set(items.map((i) => i.product_id))];
+    const productIds = [...new Set(items.map(i => i.product_id))];
     const metas = await fetchProductsMetafields(productIds);
 
     // 2) Comptes fournisseurs du client
     const accounts = await fetchCustomerVendorAccounts(customerId);
-    const mapAcc = new Map(accounts.map((a) => [a.vendor_id, a]));
+    const mapAcc = new Map(accounts.map(a => [a.vendor_id, a]));
 
     // 3) Enrichir lignes
-    const enrich = items.map((i) => {
+    const enrich = items.map(i => {
       const m = metas.get(i.product_id) || {};
       return {
         productId: i.product_id,
         variantId: i.variant_id,
         quantity: i.quantity,
         accountEligible: m.account_eligible === "true" || m.account_eligible === true,
-        vendorId: m.vendor_id || null
+        vendorId: m.vendor_id || null,
       };
     });
 
     // 4) Split
     const { onAccountGroups, payNowLines } = splitByVendorAndTerms(enrich, mapAcc);
 
-    // 5) Créer Draft Orders + PO
+    // 5) Créer Draft Orders + PO (et email si clé présente)
     const onAccountSummary = [];
     for (const grp of onAccountGroups) {
       const draft = await createDraftOrderOnAccount(grp, customerId);
-      const vendor = VENDORS.find((v) => v.vendor_id === grp.vendorId);
+      const vendor = VENDORS.find(v => v.vendor_id === grp.vendorId);
       const poHtml = buildPOHtml({ vendor, account: grp.account, draftOrder: draft });
-      // Email fournisseur (si clé présente)
       if (vendor?.po_email && SENDGRID_API_KEY) {
         await sendEmail({ to: vendor.po_email, subject: `LOGTEK PO ${draft?.name || ""}`, html: poHtml });
       }
@@ -288,17 +289,17 @@ app.post("/prepare", async (req, res) => {
         vendor_id: grp.vendorId,
         draft_order_id: draft?.id,
         po_number: draft?.name || "",
-        total: draft?.total_price || ""
+        total: draft?.total_price || "",
       });
     }
 
-    // 6) Checkout pour la partie à payer maintenant
+    // 6) Checkout pay-now
     let payNowCheckoutUrl = null;
     if (payNowLines.length) payNowCheckoutUrl = await createPayNowCheckout(payNowLines);
 
     return res.status(200).json({
       summary: { onAccount: onAccountSummary, payNow: { lines: payNowLines.length } },
-      payNowCheckoutUrl
+      payNowCheckoutUrl,
     });
 
   } catch (e) {
@@ -307,7 +308,7 @@ app.post("/prepare", async (req, res) => {
   }
 });
 
-// ---- Start ------------------------------------------------
+// ===== Start ==================================================================
 app.listen(PORT, () => {
   console.log(`Logtek split server on :${PORT}`);
 });
