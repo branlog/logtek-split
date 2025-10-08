@@ -22,22 +22,79 @@ const escapeHtml = s => (s||"").toString().replace(/[&<>"']/g, m=>({"&":"&amp;",
 // Shopify peut envoyer `hmac` (nouveau) ou `signature` (ancien).
 // Certains thèmes/instances signent `path?query` au lieu de la query seule.
 // On vérifie proprement et on logge.
+// ===== HMAC App Proxy — versions "brutes" & canoniques =========================
 function safeHmacEq(a, b) {
   try { return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")); }
   catch { return false; }
 }
 
-function canonicalize(paramsObj) {
+// Utilitaire: retourne un tableau de paires {raw, key, val}
+// - raw  = "k=v" EXACTEMENT tel qu'arrivé (encodage inchangé)
+// - key  = clé décodée (pour trier)
+// - val  = valeur décodée (juste pour debug)
+function parseRawPairs(queryString) {
+  if (!queryString) return [];
+  return queryString.split("&").filter(Boolean).map(seg => {
+    const i = seg.indexOf("=");
+    const kRaw = i >= 0 ? seg.slice(0, i) : seg;
+    const vRaw = i >= 0 ? seg.slice(i + 1) : "";
+    // Décodés uniquement pour le TRI et les logs (pas pour reconstruire)
+    let kDec, vDec;
+    try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
+    try { vDec = decodeURIComponent(vRaw); } catch { vDec = vRaw; }
+    return { raw: seg, key: kDec, val: vDec, kRaw, vRaw };
+  });
+}
+
+// Canonique "re-encodée" (notre ancienne)
+function canonicalEncoded(paramsObj) {
   const pairs = [];
   for (const [k, v] of paramsObj.entries()) pairs.push([k, v]);
   pairs.sort((a,b)=>a[0].localeCompare(b[0]));
   return pairs.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
 }
 
+// Canonique "RAW triée": on TRIE sur la clé décodée, mais on REJOINT
+// avec les fragments BRUTS d’origine (pas de ré-encodage).
+function canonicalRawSorted(queryString) {
+  const pairs = parseRawPairs(queryString)
+    .filter(p => p.key !== "hmac" && p.key !== "signature")
+    .sort((a,b)=>a.key.localeCompare(b.key));
+  return pairs.map(p => p.raw).join("&"); // IMPORTANT: on conserve le RAW
+}
+
 function verifyProxySignature(req) {
-  const full = req.originalUrl || "";
-  const qStr = full.includes("?") ? full.split("?")[1] : "";
-  const qp   = new URLSearchParams(qStr);
+  const full  = req.originalUrl || "";
+  const path  = req.path || (full.split("?")[0] || "");
+  const qStr  = full.includes("?") ? full.split("?")[1] : "";
+
+  // Récupérer valeur signée fournie
+  const urlParams = new URLSearchParams(qStr);
+  const provided  = urlParams.get("hmac") || urlParams.get("signature");
+  if (!provided) {
+    console.log("[Proxy] aucun hmac/signature");
+    return false;
+  }
+  urlParams.delete("hmac"); urlParams.delete("signature");
+
+  // 4 variantes testées
+  const variants = [
+    { label: "encoded:query",       data: canonicalEncoded(urlParams) },
+    { label: "encoded:path+query",  data: (canonicalEncoded(urlParams) ? `${path}?${canonicalEncoded(urlParams)}` : path) },
+    { label: "rawSorted:query",     data: canonicalRawSorted(qStr) },
+    { label: "rawSorted:path+query",data: (canonicalRawSorted(qStr) ? `${path}?${canonicalRawSorted(qStr)}` : path) },
+  ];
+
+  let ok = false;
+  for (const v of variants) {
+    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(v.data).digest("hex");
+    const hit = safeHmacEq(digest, provided);
+    console.log(`[Proxy HMAC] try=${v.label} | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${hit}`);
+    if (hit) ok = true;
+  }
+  return ok;
+}
+// ==============================================================================
 
   // récupérer signature (hmac prioritaire)
   const hmacParam = qp.get("hmac");
