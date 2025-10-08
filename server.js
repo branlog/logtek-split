@@ -1,3 +1,5 @@
+// server.js — Logtek Split (Express + Shopify App Proxy) — Node 18+/Render
+// ----------------------------------------------------------------------------
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
@@ -6,116 +8,84 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ENV
+// ===== ENV ====================================================================
 const SHOP             = process.env.SHOPIFY_SHOP_DOMAIN;      // ex: 2uvcbu-ci.myshopify.com
-const ADMIN_TOKEN      = process.env.SHOPIFY_ADMIN_TOKEN;
-const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;
-const APP_PROXY_SECRET = process.env.APP_PROXY_SECRET;         // Partner Dashboard → Settings → Secret
+const ADMIN_TOKEN      = process.env.SHOPIFY_ADMIN_TOKEN;      // Admin API token (shpat_…)
+const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN; // Storefront API token
+const APP_PROXY_SECRET = process.env.APP_PROXY_SECRET;         // App secret key (Partner dashboard)
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";
 const FROM_EMAIL       = process.env.FROM_EMAIL || "no-reply@logtek.ca";
 const PORT             = process.env.PORT || 10000;
 
-// --- Utils
-const escapeHtml = s => (s||"").toString().replace(/[&<>"']/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+if (!SHOP || !ADMIN_TOKEN || !APP_PROXY_SECRET) {
+  console.warn("[WARN] Variables d'env manquantes (SHOP/ADMIN_TOKEN/APP_PROXY_SECRET).");
+}
 
-// =============== HMAC (App Proxy) =================
-// Shopify peut envoyer `hmac` (nouveau) ou `signature` (ancien).
-// Certains thèmes/instances signent `path?query` au lieu de la query seule.
-// On vérifie proprement et on logge.
-// ===== HMAC App Proxy — versions "brutes" & canoniques =========================
+// ===== Fournisseurs (exemple) =================================================
+const VENDORS = [
+  { vendor_id: "centre-routier",   name: "Le Centre Routier",   po_email: "commandes@centreroutier.ca" },
+  { vendor_id: "carrefour-camion", name: "Carrefour du Camion", po_email: "achat@carrefourcamion.ca" },
+  { vendor_id: "flextral",         name: "Hose Flextral",       po_email: "orders@flextral.ca" }
+];
+
+// ===== Utils ==================================================================
+const escapeHtml = (s) =>
+  (s || "").toString().replace(/[&<>"']/g, (m) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[m]));
+
+// ====== HMAC App Proxy — variantes encodées & RAW triées ======================
 function safeHmacEq(a, b) {
   try { return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")); }
   catch { return false; }
 }
 
-// Utilitaire: retourne un tableau de paires {raw, key, val}
-// - raw  = "k=v" EXACTEMENT tel qu'arrivé (encodage inchangé)
-// - key  = clé décodée (pour trier)
-// - val  = valeur décodée (juste pour debug)
-function parseRawPairs(queryString) {
-  if (!queryString) return [];
-  return queryString.split("&").filter(Boolean).map(seg => {
-    const i = seg.indexOf("=");
-    const kRaw = i >= 0 ? seg.slice(0, i) : seg;
-    const vRaw = i >= 0 ? seg.slice(i + 1) : "";
-    // Décodés uniquement pour le TRI et les logs (pas pour reconstruire)
-    let kDec, vDec;
-    try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
-    try { vDec = decodeURIComponent(vRaw); } catch { vDec = vRaw; }
-    return { raw: seg, key: kDec, val: vDec, kRaw, vRaw };
-  });
-}
-
-// Canonique "re-encodée" (notre ancienne)
+// Canonique “encodée” (notre version classique)
 function canonicalEncoded(paramsObj) {
   const pairs = [];
   for (const [k, v] of paramsObj.entries()) pairs.push([k, v]);
-  pairs.sort((a,b)=>a[0].localeCompare(b[0]));
-  return pairs.map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+  pairs.sort((a, b) => a[0].localeCompare(b[0]));
+  return pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
 }
 
-// Canonique "RAW triée": on TRIE sur la clé décodée, mais on REJOINT
-// avec les fragments BRUTS d’origine (pas de ré-encodage).
+// Canonique “RAW triée” : on trie sur la clé décodée mais on REJOINT la query brute
 function canonicalRawSorted(queryString) {
-  const pairs = parseRawPairs(queryString)
-    .filter(p => p.key !== "hmac" && p.key !== "signature")
-    .sort((a,b)=>a.key.localeCompare(b.key));
-  return pairs.map(p => p.raw).join("&"); // IMPORTANT: on conserve le RAW
+  if (!queryString) return "";
+  const segments = queryString.split("&").filter(Boolean).map(seg => {
+    const i = seg.indexOf("=");
+    const kRaw = i >= 0 ? seg.slice(0, i) : seg;
+    const vRaw = i >= 0 ? seg.slice(i + 1) : "";
+    let kDec;
+    try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
+    return { raw: seg, kDec };
+  }).filter(p => {
+    // retirer hmac/signature si présents
+    const key = p.kDec;
+    return key !== "hmac" && key !== "signature";
+  });
+
+  segments.sort((a, b) => a.kDec.localeCompare(b.kDec));
+  return segments.map(p => p.raw).join("&");
 }
 
 function verifyProxySignature(req) {
-  const full  = req.originalUrl || "";
-  const path  = req.path || (full.split("?")[0] || "");
-  const qStr  = full.includes("?") ? full.split("?")[1] : "";
+  const full = req.originalUrl || "";
+  const path = req.path || (full.split("?")[0] || "");
+  const qStr = full.includes("?") ? full.split("?")[1] : "";
 
-  // Récupérer valeur signée fournie
   const urlParams = new URLSearchParams(qStr);
   const provided  = urlParams.get("hmac") || urlParams.get("signature");
-  if (!provided) {
-    console.log("[Proxy] aucun hmac/signature");
-    return false;
-  }
+  if (!provided) { console.log("[Proxy] aucun hmac/signature"); return false; }
   urlParams.delete("hmac"); urlParams.delete("signature");
 
-  // 4 variantes testées
-  const variants = [
-    { label: "encoded:query",       data: canonicalEncoded(urlParams) },
-    { label: "encoded:path+query",  data: (canonicalEncoded(urlParams) ? `${path}?${canonicalEncoded(urlParams)}` : path) },
-    { label: "rawSorted:query",     data: canonicalRawSorted(qStr) },
-    { label: "rawSorted:path+query",data: (canonicalRawSorted(qStr) ? `${path}?${canonicalRawSorted(qStr)}` : path) },
-  ];
-
-  let ok = false;
-  for (const v of variants) {
-    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(v.data).digest("hex");
-    const hit = safeHmacEq(digest, provided);
-    console.log(`[Proxy HMAC] try=${v.label} | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${hit}`);
-    if (hit) ok = true;
-  }
-  return ok;
-}
-// ==============================================================================
-
-  // récupérer signature (hmac prioritaire)
-  const hmacParam = qp.get("hmac");
-  const sigParam  = qp.get("signature"); // fallback legacy
-  const provided  = hmacParam || sigParam;
-  if (!provided) {
-    console.log("[Proxy] aucun hmac/signature dans la query");
-    return false;
-  }
-
-  // retirer les clés de signature
-  qp.delete("hmac"); qp.delete("signature");
-
-  // variantes possibles
-  const canonicalQ = canonicalize(qp);
-  const pathOnly   = req.path || req.url.split("?")[0] || "/prepare"; // ex: /prepare
-  const withPath   = canonicalQ ? `${pathOnly}?${canonicalQ}` : pathOnly;
+  const encQ = canonicalEncoded(urlParams);
+  const rawQ = canonicalRawSorted(qStr);
 
   const variants = [
-    { label: "query",      data: canonicalQ },
-    { label: "path+query", data: withPath  },
+    { label: "encoded:query",        data: encQ },
+    { label: "encoded:path+query",   data: encQ ? `${path}?${encQ}` : path },
+    { label: "rawSorted:query",      data: rawQ },
+    { label: "rawSorted:path+query", data: rawQ ? `${path}?${rawQ}` : path },
   ];
 
   for (const v of variants) {
@@ -126,23 +96,23 @@ function verifyProxySignature(req) {
   }
   return false;
 }
-// ===================================================
+// ==============================================================================
 
-// --- Shopify Admin GraphQL helper
+// ===== Admin GraphQL helper ===================================================
 async function adminGraphQL(query, variables) {
   const r = await fetch(`https://${SHOP}/admin/api/2025-01/graphql.json`, {
     method: "POST",
     headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
+    body: JSON.stringify({ query, variables })
   });
   return r.json();
 }
 
-// --- Metafields produits
+// ===== Metafields produits ====================================================
 async function fetchProductsMetafields(productIds) {
   if (!productIds?.length) return new Map();
-  const ids = productIds.map(id=>`gid://shopify/Product/${id}`);
-  const q = `
+  const ids = productIds.map((id) => `gid://shopify/Product/${id}`);
+  const query = `
     query($ids:[ID!]!){
       nodes(ids:$ids){
         ... on Product {
@@ -152,7 +122,7 @@ async function fetchProductsMetafields(productIds) {
         }
       }
     }`;
-  const r = await adminGraphQL(q, { ids });
+  const r = await adminGraphQL(query, { ids });
   const out = new Map();
   for (const n of r?.data?.nodes || []) {
     if (!n) continue;
@@ -162,7 +132,7 @@ async function fetchProductsMetafields(productIds) {
   return out;
 }
 
-// --- Comptes fournisseurs client
+// ===== Comptes fournisseurs client ===========================================
 async function fetchCustomerVendorAccounts(customerId) {
   if (!customerId) return [];
   const gid = `gid://shopify/Customer/${customerId}`;
@@ -173,17 +143,23 @@ async function fetchCustomerVendorAccounts(customerId) {
       }
     }`;
   const r = await adminGraphQL(q, { id: gid });
-  try { return JSON.parse(r?.data?.customer?.v?.value || "[]"); } catch { return []; }
+  const raw = r?.data?.customer?.v?.value || "[]";
+  try { return JSON.parse(raw); } catch { return []; }
 }
 
-// --- Split
+// ===== Split par fournisseur / conditions =====================================
 function splitByVendorAndTerms(lines, vendorMap) {
-  const groups = new Map(); const payNow = [];
+  const groups = new Map();
+  const payNow = [];
   for (const l of lines) {
     const hasAccount = l.vendorId && vendorMap.has(l.vendorId);
     const canAccount = hasAccount && l.accountEligible;
-    if (canAccount) { if (!groups.has(l.vendorId)) groups.set(l.vendorId, []); groups.get(l.vendorId).push(l); }
-    else payNow.push(l);
+    if (canAccount) {
+      if (!groups.has(l.vendorId)) groups.set(l.vendorId, []);
+      groups.get(l.vendorId).push(l);
+    } else {
+      payNow.push(l);
+    }
   }
   const onAccountGroups = Array.from(groups.entries()).map(([vendorId, lines]) => ({
     vendorId, lines, account: vendorMap.get(vendorId) || null
@@ -191,9 +167,9 @@ function splitByVendorAndTerms(lines, vendorMap) {
   return { onAccountGroups, payNowLines: payNow };
 }
 
-// --- Draft order au compte
+// ===== Draft order “au compte” ===============================================
 async function createDraftOrderOnAccount(group, customerId) {
-  const line_items = group.lines.map(l=>({ variant_id: l.variantId, quantity: l.quantity }));
+  const line_items = group.lines.map((l) => ({ variant_id: l.variantId, quantity: l.quantity }));
   const payload = {
     draft_order: {
       line_items,
@@ -211,13 +187,16 @@ async function createDraftOrderOnAccount(group, customerId) {
     method: "POST",
     headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  }).then(x=>x.json());
+  }).then((x) => x.json());
   return resp?.draft_order || null;
 }
 
-// --- Checkout pay-now (Storefront)
+// ===== Checkout “pay now” (Storefront) =======================================
 async function createPayNowCheckout(payNowLines) {
-  const lineItems = payNowLines.map(l=>({ quantity: l.quantity, variantId: `gid://shopify/ProductVariant/${l.variantId}` }));
+  const lineItems = payNowLines.map((l) => ({
+    quantity: l.quantity,
+    variantId: `gid://shopify/ProductVariant/${l.variantId}`
+  }));
   const query = `
     mutation checkoutCreate($input: CheckoutCreateInput!){
       checkoutCreate(input:$input){
@@ -230,21 +209,24 @@ async function createPayNowCheckout(payNowLines) {
     method: "POST",
     headers: { "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN, "Content-Type": "application/json" },
     body: JSON.stringify({ query, variables })
-  }).then(x=>x.json());
+  }).then((x) => x.json());
+  if (r?.data?.checkoutCreate?.userErrors?.length) {
+    console.error("Storefront checkoutCreate errors:", r.data.checkoutCreate.userErrors);
+  }
   return r?.data?.checkoutCreate?.checkout?.webUrl || null;
 }
 
-// --- Health
-app.get("/health", (_req,res)=>res.status(200).send("ok"));
+// ===== Health =================================================================
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// --- GET /prepare (test navigateur)
-app.get("/prepare", (req,res)=>{
+// ===== GET /prepare — test navigateur via App Proxy ===========================
+app.get("/prepare", (req, res) => {
   if (!verifyProxySignature(req)) return res.status(401).json({ error: "Invalid proxy signature" });
   return res.status(200).json({ error: "Panier vide" });
 });
 
-// --- POST /prepare (prod)
-app.post("/prepare", async (req,res)=>{
+// ===== POST /prepare — flux réel depuis le thème ==============================
+app.post("/prepare", async (req, res) => {
   try {
     if (!verifyProxySignature(req)) return res.status(401).json({ error: "Invalid proxy signature" });
 
@@ -253,12 +235,16 @@ app.post("/prepare", async (req,res)=>{
       return res.status(400).json({ error: "Panier vide" });
     }
 
-    const productIds = [...new Set(items.map(i=>i.product_id))];
+    // 1) Metafields produits
+    const productIds = [...new Set(items.map(i => i.product_id))];
     const metas = await fetchProductsMetafields(productIds);
-    const accounts = await fetchCustomerVendorAccounts(customerId);
-    const mapAcc = new Map(accounts.map(a=>[a.vendor_id, a]));
 
-    const enrich = items.map(i=>{
+    // 2) Comptes fournisseurs du client
+    const accounts = await fetchCustomerVendorAccounts(customerId);
+    const mapAcc = new Map(accounts.map(a => [a.vendor_id, a]));
+
+    // 3) Enrichir lignes
+    const enrich = items.map(i => {
       const m = metas.get(i.product_id) || {};
       return {
         productId: i.product_id,
@@ -269,8 +255,10 @@ app.post("/prepare", async (req,res)=>{
       };
     });
 
+    // 4) Split
     const { onAccountGroups, payNowLines } = splitByVendorAndTerms(enrich, mapAcc);
 
+    // 5) Draft Orders + (option) email PO
     const onAccountSummary = [];
     for (const grp of onAccountGroups) {
       const draft = await createDraftOrderOnAccount(grp, customerId);
@@ -282,6 +270,7 @@ app.post("/prepare", async (req,res)=>{
       });
     }
 
+    // 6) Checkout pay-now
     let payNowCheckoutUrl = null;
     if (payNowLines.length) payNowCheckoutUrl = await createPayNowCheckout(payNowLines);
 
@@ -295,5 +284,7 @@ app.post("/prepare", async (req,res)=>{
   }
 });
 
-app.listen(PORT, ()=>console.log(`Logtek split server on :${PORT}`));
-
+// ===== Start ==================================================================
+app.listen(PORT, () => {
+  console.log(`Logtek split server on :${PORT}`);
+});
