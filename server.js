@@ -242,11 +242,44 @@ app.get("/prepare", (req, res) => {
 
 // POST /prepare — route utilisée par le bouton “Payer (split)” côté thème
 app.post("/prepare", async (req, res) => {
+  function verifyProxyHmac(queryString) {
   try {
-    const query = (req.originalUrl.split("?")[1]) || "";
-    if (!verifyProxyHmac(query)) {
-      return res.status(401).json({ error: "Invalid proxy signature" });
+    // 1) Parser la query et enlever hmac
+    const params = new URLSearchParams(queryString || "");
+    const hmac = params.get("hmac");
+    if (!hmac) return false;
+    params.delete("hmac");
+
+    // 2) Re-construire la query en ORDRE ALPHABÉTIQUE (clé = triée)
+    const pairs = [];
+    for (const [k, v] of params.entries()) {
+      pairs.push([k, v]);
     }
+    pairs.sort((a, b) => a[0].localeCompare(b[0]));
+
+    // 3) Chaîne canonique exactement encodée comme Shopify
+    const canonical = pairs
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
+
+    // 4) Calcul HMAC SHA256 avec le secret App Proxy
+    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET)
+      .update(canonical)
+      .digest("hex");
+
+    // ---- LOG DEBUG (sûr) : compare 8 premiers chars
+    console.log("[Proxy HMAC] digest8:", digest.slice(0,8), "hmac8:", hmac.slice(0,8));
+
+    return crypto.timingSafeEqual(
+      Buffer.from(digest, "utf8"),
+      Buffer.from(hmac, "utf8")
+    );
+  } catch (e) {
+    console.error("verifyProxyHmac error:", e);
+    return false;
+  }
+}
+
 
     const { customerId, items } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
