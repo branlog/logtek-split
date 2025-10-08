@@ -244,11 +244,7 @@ app.get("/prepare", (req, res) => {
 // App Proxy target: Shopify appellera /apps/logtek-split/prepare => proxifié ici en /prepare?...&hmac=...
 app.post("/prepare", async (req, res) => {
   try {
-    // Vérif de la signature proxy
-    const query = (req.originalUrl.split("?")[1]) || "";
-    if (!verifyProxyHmac(query)) {
-      return res.status(401).json({ error: "Invalid proxy signature" });
-    }
+    
 
     const { customerId, items } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
