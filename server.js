@@ -42,6 +42,31 @@ function verifyProxyHmac(queryString) {
     if (!hmac) return false;
     params.delete("hmac");
 
+    const pairs = [];
+    for (const [k, v] of params.entries()) pairs.push([k, v]);
+    pairs.sort((a, b) => a[0].localeCompare(b[0]));
+
+    const canonical = pairs
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
+
+    const digest = crypto
+      .createHmac("sha256", APP_PROXY_SECRET)
+      .update(canonical)
+      .digest("hex");
+
+    console.log("[Proxy HMAC] digest8:", digest.slice(0, 8), "hmac8:", hmac.slice(0, 8));
+
+    return crypto.timingSafeEqual(
+      Buffer.from(digest, "utf-8"),
+      Buffer.from(hmac, "utf-8")
+    );
+  } catch (err) {
+    console.error("verifyProxyHmac error:", err);
+    return false;
+  }
+}
+
     // Recréer la query en ordre alphabétique
     const pairs = [];
     for (const [k, v] of params.entries()) pairs.push([k, v]);
