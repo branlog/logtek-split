@@ -1,5 +1,5 @@
-// server.js — Logtek Split (Express + Shopify App Proxy) — Node 18+ / Render
-// -------------------------------------------------------------------------
+// server.js — Logtek Split (Express + Shopify App Proxy) — Node 18+/Render
+// -----------------------------------------------------------------------
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
@@ -34,7 +34,7 @@ const escapeHtml = (s) =>
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[m]));
 
-// HMAC Shopify App Proxy — TRI ALPHABÉTIQUE + encodage canonique
+// HMAC Shopify App Proxy — tri alphabétique + encodage canonique
 function verifyProxyHmac(queryString) {
   try {
     const params = new URLSearchParams(queryString || "");
@@ -42,50 +42,32 @@ function verifyProxyHmac(queryString) {
     if (!hmac) return false;
     params.delete("hmac");
 
+    // Recréer la query en ordre alphabétique
     const pairs = [];
     for (const [k, v] of params.entries()) pairs.push([k, v]);
     pairs.sort((a, b) => a[0].localeCompare(b[0]));
 
+    // Chaîne canonique encodée
     const canonical = pairs
       .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
       .join("&");
 
+    // HMAC SHA256
     const digest = crypto
       .createHmac("sha256", APP_PROXY_SECRET)
       .update(canonical)
       .digest("hex");
 
+    // Log debug safe (8 premiers chars)
     console.log("[Proxy HMAC] digest8:", digest.slice(0, 8), "hmac8:", hmac.slice(0, 8));
 
+    // Comparaison sécurisée
     return crypto.timingSafeEqual(
       Buffer.from(digest, "utf-8"),
       Buffer.from(hmac, "utf-8")
     );
   } catch (err) {
     console.error("verifyProxyHmac error:", err);
-    return false;
-  }
-}
-
-    // Recréer la query en ordre alphabétique
-    const pairs = [];
-    for (const [k, v] of params.entries()) pairs.push([k, v]);
-    pairs.sort((a, b) => a[0].localeCompare(b[0]));
-
-    const canonical = pairs
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join("&");
-
-    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET)
-      .update(canonical)
-      .digest("hex");
-
-    // Log debug safe (8 premiers caractères)
-    console.log("[Proxy HMAC] digest8:", digest.slice(0,8), "hmac8:", hmac.slice(0,8));
-
-    return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
-  } catch (e) {
-    console.error("verifyProxyHmac error:", e);
     return false;
   }
 }
@@ -254,14 +236,14 @@ async function sendEmail({ to, subject, html }) {
 // Healthcheck Render
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// GET /prepare — test rapide au navigateur via App Proxy
+// GET /prepare — test navigateur via App Proxy
 app.get("/prepare", (req, res) => {
   const q = (req.originalUrl.split("?")[1]) || "";
   if (!verifyProxyHmac(q)) return res.status(401).json({ error: "Invalid proxy signature" });
   return res.status(200).json({ error: "Panier vide" });
 });
 
-// POST /prepare — utilisé par le bouton “Payer (split)” côté thème
+// POST /prepare — utilisé par le bouton “Payer (split)”
 app.post("/prepare", async (req, res) => {
   try {
     const q = (req.originalUrl.split("?")[1]) || "";
@@ -330,4 +312,3 @@ app.post("/prepare", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Logtek split server on :${PORT}`);
 });
-
