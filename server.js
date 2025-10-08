@@ -232,6 +232,14 @@ async function sendEmail({ to, subject, html }) {
 
 // Healthcheck Render
 app.get("/health", (_req, res) => res.status(200).send("ok"));
+// Test GET via App Proxy (pour vérif rapide dans le navigateur)
+app.get("/prepare", (req, res) => {
+  const query = (req.originalUrl.split("?")[1]) || "";
+  if (!verifyProxyHmac(query)) {
+    return res.status(401).json({ error: "Invalid proxy signature" });
+  }
+  return res.status(200).json({ error: "Panier vide" });
+});
 
 // App Proxy target: Shopify appellera /apps/logtek-split/prepare => proxifié ici en /prepare?...&hmac=...
 app.post("/prepare", async (req, res) => {
