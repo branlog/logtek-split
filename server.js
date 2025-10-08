@@ -3,7 +3,8 @@
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
-console.log("Logtek split — HMAC v4 loaded");
+console.log("Logtek split — HMAC v5 loaded");
+
 
 
 const app = express();
@@ -38,11 +39,13 @@ const escapeHtml = (s) =>
 
 // ====== HMAC App Proxy — variantes encodées & RAW triées ======================
 // ===== HMAC App Proxy — v4 (encoded/raw + express path + PROXY path) =========
+// ===== HMAC App Proxy — v5 (encoded, rawSorted, rawOriginal, proxy path) ======
 function safeHmacEq(a, b) {
   try { return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")); }
   catch { return false; }
 }
 
+// Encodée + triée (classique)
 function canonicalEncoded(paramsObj) {
   const pairs = [];
   for (const [k, v] of paramsObj.entries()) pairs.push([k, v]);
@@ -50,12 +53,12 @@ function canonicalEncoded(paramsObj) {
   return pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
 }
 
+// RAW + triée (on conserve les fragments bruts, mais on trie)
 function canonicalRawSorted(queryString) {
   if (!queryString) return "";
   const segs = queryString.split("&").filter(Boolean).map(seg => {
     const i = seg.indexOf("=");
     const kRaw = i >= 0 ? seg.slice(0, i) : seg;
-    const vRaw = i >= 0 ? seg.slice(i + 1) : "";
     let kDec;
     try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
     return { raw: seg, kDec };
@@ -64,50 +67,67 @@ function canonicalRawSorted(queryString) {
   return segs.map(p => p.raw).join("&");
 }
 
+// RAW + ordre d'origine (AUCUN tri, on enlève juste hmac/signature et on garde l'ordre exact)
+function rawOriginalWithoutSig(queryString) {
+  if (!queryString) return "";
+  const parts = [];
+  for (const seg of queryString.split("&")) {
+    if (!seg) continue;
+    const i = seg.indexOf("=");
+    const kRaw = i >= 0 ? seg.slice(0, i) : seg;
+    let kDec;
+    try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
+    if (kDec === "hmac" || kDec === "signature") continue;
+    parts.push(seg); // on conserve tel quel (encodage/ordre d'origine)
+  }
+  return parts.join("&");
+}
+
 function verifyProxySignature(req) {
-  const full = req.originalUrl || "";              // ex: "/prepare?foo=bar&hmac=...."
-  const rawPath = full.split("?")[0] || "";
-  const qStr = full.includes("?") ? full.split("?")[1] : "";
+  const full     = req.originalUrl || "";               // ex: "/prepare?shop=...&hmac=..."
+  const rawPath  = full.split("?")[0] || "";
+  const qStr     = full.includes("?") ? full.split("?")[1] : "";
 
   const urlParams = new URLSearchParams(qStr);
-  const provided = urlParams.get("hmac") || urlParams.get("signature");
-  if (!provided) { console.log("[Proxy v4] aucun hmac/signature"); return false; }
-  urlParams.delete("hmac"); urlParams.delete("signature");
+  const provided  = urlParams.get("hmac") || urlParams.get("signature");
+  if (!provided) { console.log("[Proxy v5] aucun hmac/signature"); return false; }
 
-  const encQ = canonicalEncoded(urlParams);
-  const rawQ = canonicalRawSorted(qStr);
+  // Prépare les 3 variantes de base de la query
+  const encQ   = (() => { const p = new URLSearchParams(qStr); p.delete("hmac"); p.delete("signature"); return canonicalEncoded(p); })();
+  const rawQ   = canonicalRawSorted(qStr);
+  const rawOri = rawOriginalWithoutSig(qStr);
 
-  // Express voit /prepare ; Shopify signe en général /apps/logtek-split/prepare
-  const expressPath = req.path || rawPath || "/prepare";
-  const proxyPrefix = "/apps";
-  const proxySub    = "/logtek-split";
-  const proxyPath   = `${proxyPrefix}${proxySub}${expressPath}`;  // "/apps/logtek-split/prepare"
+  // Chemins candidats : express et proxy complet
+  const expressPath = req.path || rawPath || "/prepare";                // "/prepare"
+  const proxyPath   = `/apps/logtek-split${expressPath}`;               // "/apps/logtek-split/prepare"
 
-  // Petits helpers d’affichage (pour prouver ce qu’on signe)
-  const show = (s) => (s || "").toString().slice(0, 120);
+  const show = (s) => (s || "").toString().slice(0, 140);
 
   const candidates = [
-    { label: "encoded:query",            data: encQ },
-    { label: "encoded:path(express)",    data: encQ ? `${expressPath}?${encQ}` : expressPath },
-    { label: "encoded:path(proxy)",      data: encQ ? `${proxyPath}?${encQ}`   : proxyPath   },
-    { label: "rawSorted:query",          data: rawQ },
-    { label: "rawSorted:path(express)",  data: rawQ ? `${expressPath}?${rawQ}` : expressPath },
-    { label: "rawSorted:path(proxy)",    data: rawQ ? `${proxyPath}?${rawQ}`   : proxyPath   },
+    { label: "encoded:query",             data: encQ },
+    { label: "encoded:path(express)",     data: encQ   ? `${expressPath}?${encQ}` : expressPath },
+    { label: "encoded:path(proxy)",       data: encQ   ? `${proxyPath}?${encQ}`   : proxyPath },
+    { label: "rawSorted:query",           data: rawQ },
+    { label: "rawSorted:path(express)",   data: rawQ   ? `${expressPath}?${rawQ}` : expressPath },
+    { label: "rawSorted:path(proxy)",     data: rawQ   ? `${proxyPath}?${rawQ}`   : proxyPath },
+    { label: "rawOriginal:query",         data: rawOri },
+    { label: "rawOriginal:path(proxy)",   data: rawOri ? `${proxyPath}?${rawOri}` : proxyPath },
   ];
 
-  console.log(`[Proxy v4] fullPathReceived="${rawPath}"`);
-  console.log(`[Proxy v4] expressPath="${expressPath}" proxyPath="${proxyPath}"`);
-  console.log(`[Proxy v4] encQ="${show(encQ)}"`);
-  console.log(`[Proxy v4] rawQ="${show(rawQ)}"`);
+  console.log(`[Proxy v5] expressPath="${expressPath}" proxyPath="${proxyPath}" rawPath="${rawPath}"`);
+  console.log(`[Proxy v5] encQ="${show(encQ)}"`);
+  console.log(`[Proxy v5] rawQ="${show(rawQ)}"`);
+  console.log(`[Proxy v5] rawOri="${show(rawOri)}"`);
 
   for (const v of candidates) {
     const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(v.data).digest("hex");
     const ok = safeHmacEq(digest, provided);
-    console.log(`[Proxy v4] try=${v.label} | base="${show(v.data)}" | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${ok}`);
+    console.log(`[Proxy v5] try=${v.label} | base="${show(v.data)}" | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${ok}`);
     if (ok) return true;
   }
   return false;
 }
+
 
 // ==============================================================================
 
