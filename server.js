@@ -3,6 +3,8 @@
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
+console.log("Logtek split — HMAC v4 loaded");
+
 
 const app = express();
 app.use(express.json());
@@ -35,12 +37,12 @@ const escapeHtml = (s) =>
   }[m]));
 
 // ====== HMAC App Proxy — variantes encodées & RAW triées ======================
+// ===== HMAC App Proxy — v4 (encoded/raw + express path + PROXY path) =========
 function safeHmacEq(a, b) {
   try { return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")); }
   catch { return false; }
 }
 
-// Canonique “encodée” (notre version classique)
 function canonicalEncoded(paramsObj) {
   const pairs = [];
   for (const [k, v] of paramsObj.entries()) pairs.push([k, v]);
@@ -48,54 +50,65 @@ function canonicalEncoded(paramsObj) {
   return pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
 }
 
-// Canonique “RAW triée” : on trie sur la clé décodée mais on REJOINT la query brute
 function canonicalRawSorted(queryString) {
   if (!queryString) return "";
-  const segments = queryString.split("&").filter(Boolean).map(seg => {
+  const segs = queryString.split("&").filter(Boolean).map(seg => {
     const i = seg.indexOf("=");
     const kRaw = i >= 0 ? seg.slice(0, i) : seg;
     const vRaw = i >= 0 ? seg.slice(i + 1) : "";
     let kDec;
     try { kDec = decodeURIComponent(kRaw); } catch { kDec = kRaw; }
     return { raw: seg, kDec };
-  }).filter(p => {
-    // retirer hmac/signature si présents
-    const key = p.kDec;
-    return key !== "hmac" && key !== "signature";
-  });
-
-  segments.sort((a, b) => a.kDec.localeCompare(b.kDec));
-  return segments.map(p => p.raw).join("&");
+  }).filter(p => p.kDec !== "hmac" && p.kDec !== "signature");
+  segs.sort((a, b) => a.kDec.localeCompare(b.kDec));
+  return segs.map(p => p.raw).join("&");
 }
 
 function verifyProxySignature(req) {
-  const full = req.originalUrl || "";
-  const path = req.path || (full.split("?")[0] || "");
+  const full = req.originalUrl || "";              // ex: "/prepare?foo=bar&hmac=...."
+  const rawPath = full.split("?")[0] || "";
   const qStr = full.includes("?") ? full.split("?")[1] : "";
 
   const urlParams = new URLSearchParams(qStr);
-  const provided  = urlParams.get("hmac") || urlParams.get("signature");
-  if (!provided) { console.log("[Proxy] aucun hmac/signature"); return false; }
+  const provided = urlParams.get("hmac") || urlParams.get("signature");
+  if (!provided) { console.log("[Proxy v4] aucun hmac/signature"); return false; }
   urlParams.delete("hmac"); urlParams.delete("signature");
 
   const encQ = canonicalEncoded(urlParams);
   const rawQ = canonicalRawSorted(qStr);
 
-  const variants = [
-    { label: "encoded:query",        data: encQ },
-    { label: "encoded:path+query",   data: encQ ? `${path}?${encQ}` : path },
-    { label: "rawSorted:query",      data: rawQ },
-    { label: "rawSorted:path+query", data: rawQ ? `${path}?${rawQ}` : path },
+  // Express voit /prepare ; Shopify signe en général /apps/logtek-split/prepare
+  const expressPath = req.path || rawPath || "/prepare";
+  const proxyPrefix = "/apps";
+  const proxySub    = "/logtek-split";
+  const proxyPath   = `${proxyPrefix}${proxySub}${expressPath}`;  // "/apps/logtek-split/prepare"
+
+  // Petits helpers d’affichage (pour prouver ce qu’on signe)
+  const show = (s) => (s || "").toString().slice(0, 120);
+
+  const candidates = [
+    { label: "encoded:query",            data: encQ },
+    { label: "encoded:path(express)",    data: encQ ? `${expressPath}?${encQ}` : expressPath },
+    { label: "encoded:path(proxy)",      data: encQ ? `${proxyPath}?${encQ}`   : proxyPath   },
+    { label: "rawSorted:query",          data: rawQ },
+    { label: "rawSorted:path(express)",  data: rawQ ? `${expressPath}?${rawQ}` : expressPath },
+    { label: "rawSorted:path(proxy)",    data: rawQ ? `${proxyPath}?${rawQ}`   : proxyPath   },
   ];
 
-  for (const v of variants) {
+  console.log(`[Proxy v4] fullPathReceived="${rawPath}"`);
+  console.log(`[Proxy v4] expressPath="${expressPath}" proxyPath="${proxyPath}"`);
+  console.log(`[Proxy v4] encQ="${show(encQ)}"`);
+  console.log(`[Proxy v4] rawQ="${show(rawQ)}"`);
+
+  for (const v of candidates) {
     const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(v.data).digest("hex");
     const ok = safeHmacEq(digest, provided);
-    console.log(`[Proxy HMAC] try=${v.label} | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${ok}`);
+    console.log(`[Proxy v4] try=${v.label} | base="${show(v.data)}" | digest8=${digest.slice(0,8)} | prov8=${provided.slice(0,8)} | ok=${ok}`);
     if (ok) return true;
   }
   return false;
 }
+
 // ==============================================================================
 
 // ===== Admin GraphQL helper ===================================================
