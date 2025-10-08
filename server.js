@@ -1,5 +1,5 @@
-// server.js — Logtek Split (Express + Shopify App Proxy) — Compatible Render/Node 18+
-// -----------------------------------------------------------------------------
+// server.js — Logtek Split (Express + Shopify App Proxy) — Node 18+ / Render
+// -------------------------------------------------------------------------
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
@@ -9,19 +9,19 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // ===== ENV ====================================================================
-const SHOP                = process.env.SHOPIFY_SHOP_DOMAIN;            // ex: 2uvcbu-ci.myshopify.com
-const ADMIN_TOKEN         = process.env.SHOPIFY_ADMIN_TOKEN;            // Admin API token
-const STOREFRONT_TOKEN    = process.env.SHOPIFY_STOREFRONT_TOKEN;       // Storefront token
-const APP_PROXY_SECRET    = process.env.APP_PROXY_SECRET;               // Partner dashboard → Settings → Secret
-const SENDGRID_API_KEY    = process.env.SENDGRID_API_KEY || "";         // optionnel
-const FROM_EMAIL          = process.env.FROM_EMAIL || "no-reply@logtek.ca";
-const PORT                = process.env.PORT || 10000;
+const SHOP             = process.env.SHOPIFY_SHOP_DOMAIN;            // ex: 2uvcbu-ci.myshopify.com
+const ADMIN_TOKEN      = process.env.SHOPIFY_ADMIN_TOKEN;            // Admin API token
+const STOREFRONT_TOKEN = process.env.SHOPIFY_STOREFRONT_TOKEN;       // Storefront token
+const APP_PROXY_SECRET = process.env.APP_PROXY_SECRET;               // Partner Dashboard → Settings → Secret
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || "";         // optionnel
+const FROM_EMAIL       = process.env.FROM_EMAIL || "no-reply@logtek.ca";
+const PORT             = process.env.PORT || 10000;
 
 if (!SHOP || !ADMIN_TOKEN) {
   console.warn("[WARN] SHOPIFY_SHOP_DOMAIN ou SHOPIFY_ADMIN_TOKEN manquant(s).");
 }
 
-// ===== Fournisseurs (exemple) =================================================
+// ===== Fournisseurs (exemple simple) ==========================================
 const VENDORS = [
   { vendor_id: "centre-routier",   name: "Le Centre Routier",   po_email: "commandes@centreroutier.ca" },
   { vendor_id: "carrefour-camion", name: "Carrefour du Camion", po_email: "achat@carrefourcamion.ca" },
@@ -34,19 +34,31 @@ const escapeHtml = (s) =>
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[m]));
 
-// HMAC check pour App Proxy
+// HMAC Shopify App Proxy — TRI ALPHABÉTIQUE + encodage canonique
 function verifyProxyHmac(queryString) {
   try {
     const params = new URLSearchParams(queryString || "");
     const hmac = params.get("hmac");
+    if (!hmac) return false;
     params.delete("hmac");
-    const raw = params.toString();
-    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET).update(raw).digest("hex");
 
-    // --- DEBUG SAFE (8 premiers caractères) ---
-    console.log("[Proxy HMAC] hasHmac:", !!hmac, "| digest8:", digest.slice(0,8), "| hmac8:", (hmac||"").slice(0,8));
+    // Recréer la query en ordre alphabétique
+    const pairs = [];
+    for (const [k, v] of params.entries()) pairs.push([k, v]);
+    pairs.sort((a, b) => a[0].localeCompare(b[0]));
 
-    return hmac && crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
+    const canonical = pairs
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
+
+    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET)
+      .update(canonical)
+      .digest("hex");
+
+    // Log debug safe (8 premiers caractères)
+    console.log("[Proxy HMAC] digest8:", digest.slice(0,8), "hmac8:", hmac.slice(0,8));
+
+    return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
   } catch (e) {
     console.error("verifyProxyHmac error:", e);
     return false;
@@ -56,11 +68,8 @@ function verifyProxyHmac(queryString) {
 async function adminGraphQL(query, variables) {
   const r = await fetch(`https://${SHOP}/admin/api/2025-01/graphql.json`, {
     method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": ADMIN_TOKEN,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
+    headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables })
   });
   return r.json();
 }
@@ -83,10 +92,7 @@ async function fetchProductsMetafields(productIds) {
   for (const n of r?.data?.nodes || []) {
     if (!n) continue;
     const pid = Number(n.id.split("/").pop());
-    out.set(pid, {
-      account_eligible: n?.m1?.value || "false",
-      vendor_id: n?.m2?.value || null,
-    });
+    out.set(pid, { account_eligible: n?.m1?.value || "false", vendor_id: n?.m2?.value || null });
   }
   return out;
 }
@@ -120,7 +126,7 @@ function splitByVendorAndTerms(lines, vendorMap) {
     }
   }
   const onAccountGroups = Array.from(groups.entries()).map(([vendorId, lines]) => ({
-    vendorId, lines, account: vendorMap.get(vendorId) || null,
+    vendorId, lines, account: vendorMap.get(vendorId) || null
   }));
   return { onAccountGroups, payNowLines: payNow };
 }
@@ -135,15 +141,15 @@ async function createDraftOrderOnAccount(group, customerId) {
       note_attributes: [
         { name: "Vendor", value: group.vendorId },
         { name: "Account No", value: group.account?.account_no || "" },
-        { name: "Type", value: "Au compte" },
+        { name: "Type", value: "Au compte" }
       ],
-      use_customer_default_address: true,
-    },
+      use_customer_default_address: true
+    }
   };
   const resp = await fetch(`https://${SHOP}/admin/api/2025-01/draft_orders.json`, {
     method: "POST",
     headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(payload)
   }).then((x) => x.json());
   return resp?.draft_order || null;
 }
@@ -151,7 +157,7 @@ async function createDraftOrderOnAccount(group, customerId) {
 async function createPayNowCheckout(payNowLines) {
   const lineItems = payNowLines.map((l) => ({
     quantity: l.quantity,
-    variantId: `gid://shopify/ProductVariant/${l.variantId}`,
+    variantId: `gid://shopify/ProductVariant/${l.variantId}`
   }));
   const query = `
     mutation checkoutCreate($input: CheckoutCreateInput!){
@@ -163,11 +169,8 @@ async function createPayNowCheckout(payNowLines) {
   const variables = { input: { lineItems } };
   const r = await fetch(`https://${SHOP}/api/2023-10/graphql.json`, {
     method: "POST",
-    headers: {
-      "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ query, variables }),
+    headers: { "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN, "Content-Type": "application/json" },
+    body: JSON.stringify({ query, variables })
   }).then((x) => x.json());
   if (r?.data?.checkoutCreate?.userErrors?.length) {
     console.error("Storefront checkoutCreate errors:", r.data.checkoutCreate.userErrors);
@@ -176,15 +179,13 @@ async function createPayNowCheckout(payNowLines) {
 }
 
 function buildPOHtml({ vendor, account, draftOrder }) {
-  const rows = (draftOrder?.line_items || [])
-    .map((li) => {
-      const sku = li?.sku || li?.variant_id || "";
-      const title = li?.title || "";
-      const qty = li?.quantity || 1;
-      const total = li?.original_total || "";
-      return `<tr><td>${escapeHtml(sku)}</td><td>${escapeHtml(title)}</td><td>${qty}</td><td class="right">${escapeHtml(total?.toString()||"")}</td></tr>`;
-    })
-    .join("\n");
+  const rows = (draftOrder?.line_items || []).map((li) => {
+    const sku = li?.sku || li?.variant_id || "";
+    const title = li?.title || "";
+    const qty = li?.quantity || 1;
+    const total = li?.original_total || "";
+    return `<tr><td>${escapeHtml(sku)}</td><td>${escapeHtml(title)}</td><td>${qty}</td><td class="right">${escapeHtml(total?.toString()||"")}</td></tr>`;
+  }).join("\n");
 
   return `<!doctype html><html><head><meta charset="utf-8">
   <style>
@@ -213,16 +214,13 @@ async function sendEmail({ to, subject, html }) {
   if (!to || !SENDGRID_API_KEY) return;
   const r = await fetch("https://api.sendgrid.com/v3/mail/send", {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${SENDGRID_API_KEY}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${SENDGRID_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       personalizations: [{ to: [{ email: to }] }],
       from: { email: FROM_EMAIL, name: "LOGTEK" },
       subject,
-      content: [{ type: "text/html", value: html }],
-    }),
+      content: [{ type: "text/html", value: html }]
+    })
   });
   if (!r.ok) console.error("Sendgrid error", await r.text());
 }
@@ -231,55 +229,18 @@ async function sendEmail({ to, subject, html }) {
 // Healthcheck Render
 app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-// GET /prepare — pour test rapide au navigateur via App Proxy
+// GET /prepare — test rapide au navigateur via App Proxy
 app.get("/prepare", (req, res) => {
-  const query = (req.originalUrl.split("?")[1]) || "";
-  if (!verifyProxyHmac(query)) {
-    return res.status(401).json({ error: "Invalid proxy signature" });
-  }
+  const q = (req.originalUrl.split("?")[1]) || "";
+  if (!verifyProxyHmac(q)) return res.status(401).json({ error: "Invalid proxy signature" });
   return res.status(200).json({ error: "Panier vide" });
 });
 
-// POST /prepare — route utilisée par le bouton “Payer (split)” côté thème
+// POST /prepare — utilisé par le bouton “Payer (split)” côté thème
 app.post("/prepare", async (req, res) => {
-  function verifyProxyHmac(queryString) {
   try {
-    // 1) Parser la query et enlever hmac
-    const params = new URLSearchParams(queryString || "");
-    const hmac = params.get("hmac");
-    if (!hmac) return false;
-    params.delete("hmac");
-
-    // 2) Re-construire la query en ORDRE ALPHABÉTIQUE (clé = triée)
-    const pairs = [];
-    for (const [k, v] of params.entries()) {
-      pairs.push([k, v]);
-    }
-    pairs.sort((a, b) => a[0].localeCompare(b[0]));
-
-    // 3) Chaîne canonique exactement encodée comme Shopify
-    const canonical = pairs
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join("&");
-
-    // 4) Calcul HMAC SHA256 avec le secret App Proxy
-    const digest = crypto.createHmac("sha256", APP_PROXY_SECRET)
-      .update(canonical)
-      .digest("hex");
-
-    // ---- LOG DEBUG (sûr) : compare 8 premiers chars
-    console.log("[Proxy HMAC] digest8:", digest.slice(0,8), "hmac8:", hmac.slice(0,8));
-
-    return crypto.timingSafeEqual(
-      Buffer.from(digest, "utf8"),
-      Buffer.from(hmac, "utf8")
-    );
-  } catch (e) {
-    console.error("verifyProxyHmac error:", e);
-    return false;
-  }
-}
-
+    const q = (req.originalUrl.split("?")[1]) || "";
+    if (!verifyProxyHmac(q)) return res.status(401).json({ error: "Invalid proxy signature" });
 
     const { customerId, items } = req.body || {};
     if (!Array.isArray(items) || items.length === 0) {
@@ -302,14 +263,14 @@ app.post("/prepare", async (req, res) => {
         variantId: i.variant_id,
         quantity: i.quantity,
         accountEligible: m.account_eligible === "true" || m.account_eligible === true,
-        vendorId: m.vendor_id || null,
+        vendorId: m.vendor_id || null
       };
     });
 
     // 4) Split
     const { onAccountGroups, payNowLines } = splitByVendorAndTerms(enrich, mapAcc);
 
-    // 5) Créer Draft Orders + PO (et email si clé présente)
+    // 5) Draft Orders + PO (email si clé présente)
     const onAccountSummary = [];
     for (const grp of onAccountGroups) {
       const draft = await createDraftOrderOnAccount(grp, customerId);
@@ -322,7 +283,7 @@ app.post("/prepare", async (req, res) => {
         vendor_id: grp.vendorId,
         draft_order_id: draft?.id,
         po_number: draft?.name || "",
-        total: draft?.total_price || "",
+        total: draft?.total_price || ""
       });
     }
 
@@ -332,9 +293,8 @@ app.post("/prepare", async (req, res) => {
 
     return res.status(200).json({
       summary: { onAccount: onAccountSummary, payNow: { lines: payNowLines.length } },
-      payNowCheckoutUrl,
+      payNowCheckoutUrl
     });
-
   } catch (e) {
     console.error("Server error:", e);
     return res.status(500).json({ error: "Server error" });
@@ -345,3 +305,4 @@ app.post("/prepare", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Logtek split server on :${PORT}`);
 });
+
