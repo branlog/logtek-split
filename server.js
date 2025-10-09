@@ -12,39 +12,62 @@ const APP_PROXY_SECRET = process.env.APP_PROXY_SECRET;
 const PORT = process.env.PORT || 10000;
 
 // --- Vérification HMAC proxy Shopify ---
-function verifyProxyHmac(req) {
-  const url = new URL(req.originalUrl, `https://${req.get("host")}`);
-  const query = new URLSearchParams(url.searchParams);
-  const hmac = query.get("hmac");
+function verifyProxySignature(req) {
+  try {
+    const original = req.originalUrl || req.url || "";
+    const pathOnly = original.split("?")[0] || "/prepare";
+    const qs = original.includes("?") ? original.split("?")[1] : "";
 
-  if (!hmac) return false;
-  query.delete("hmac");
+    const params = new URLSearchParams(qs);
+    const providedHmac = params.get("hmac");
+    const providedSig  = params.get("signature");
 
-  // Recrée le format que Shopify signe : path + ? + query trié
-  const sortedParams = new URLSearchParams(
-    Array.from(query.entries()).sort((a, b) => a[0].localeCompare(b[0]))
-  );
+    // ---> Nouveau : on prend l'un ou l'autre, même algo SHA256
+    const provided = providedHmac || providedSig;
+    if (!provided) return false;
 
-  const message = `${req.path}?${sortedParams.toString()}`;
-  const digest = crypto
-    .createHmac("sha256", APP_PROXY_SECRET)
-    .update(message)
-    .digest("hex");
+    // Retirer les champs de signature avant de construire la chaîne
+    params.delete("hmac");
+    params.delete("signature");
 
-  const ok = crypto.timingSafeEqual(
-    Buffer.from(digest, "utf8"),
-    Buffer.from(hmac, "utf8")
-  );
+    // Query triée (clé asc) + encodage standard
+    const sorted = new URLSearchParams(
+      Array.from(params.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+    ).toString();
 
-  console.log(
-    `[Proxy HMAC] message="${message}" | digest8=${digest.slice(
-      0,
-      8
-    )} | prov8=${hmac.slice(0, 8)} | ok=${ok}`
-  );
+    // On doit tester au moins ces bases :
+    const expressPath = req.path || pathOnly;                 // ex: "/prepare"
+    const proxyPath   = `/apps/logtek-split${expressPath}`;   // ex: "/apps/logtek-split/prepare"
+    const proxyRoot   = `/apps/logtek-split`;                 // ex: "/apps/logtek-split"
 
-  return ok;
+    const candidates = [
+      sorted ? `${expressPath}?${sorted}` : expressPath,
+      sorted ? `${proxyPath}?${sorted}`   : proxyPath,
+      sorted ? `${proxyRoot}?${sorted}`   : proxyRoot,
+    ];
+
+    for (const base of candidates) {
+      const digest = crypto.createHmac("sha256", APP_PROXY_SECRET)
+        .update(base)
+        .digest("hex");
+
+      const ok = crypto.timingSafeEqual(
+        Buffer.from(digest, "utf8"),
+        Buffer.from(provided, "utf8")
+      );
+
+      console.log(`[Proxy HMAC] base="${base}" | d8=${digest.slice(0,8)} | p8=${provided.slice(0,8)} | ok=${ok}`);
+      if (ok) return true;
+    }
+
+    console.log("[Proxy] aucune variante ne matche → 401");
+    return false;
+  } catch (e) {
+    console.log("[Proxy] exception verify:", e?.message || e);
+    return false;
+  }
 }
+
 
 // --- Route test /prepare ---
 app.get("/prepare", async (req, res) => {
