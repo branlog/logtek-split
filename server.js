@@ -18,110 +18,87 @@ const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN || "";
 /* -----------------------
    Helpers HMAC / canonical
    ----------------------- */
-function safeTimingEq(a, b) {
+function safeEq(a, b) {
   try { return crypto.timingSafeEqual(Buffer.from(a, "utf8"), Buffer.from(b, "utf8")); }
-  catch (e) { return false; }
+  catch { return false; }
 }
+const enc = s => encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 
-function encodeRFC3986(str) {
-  return encodeURIComponent(str).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+function sortEncoded(params) {
+  const arr = Array.from(params.entries());
+  arr.sort((a,b)=>a[0].localeCompare(b[0]));
+  return arr.map(([k,v])=>`${enc(k)}=${enc(v)}`).join("&");
 }
-
-function toHexDigest(secret, message) {
-  return crypto.createHmac("sha256", secret).update(message).digest("hex");
+function sortRaw(params) {
+  const arr = Array.from(params.entries());
+  arr.sort((a,b)=>a[0].localeCompare(b[0]));
+  return arr.map(([k,v])=>`${k}=${v}`).join("&");
 }
+function rawQS(params) { return params.toString(); }
 
-function buildPairsFrom(searchParams) {
-  const pairs = [];
-  for (const [k, v] of searchParams.entries()) pairs.push([k, v]);
-  return pairs;
-}
-
-function canonical_sorted_encoded(paramsObj) {
-  const pairs = buildPairsFrom(paramsObj);
-  pairs.sort((a, b) => a[0].localeCompare(b[0]));
-  return pairs.map(([k, v]) => `${encodeRFC3986(k)}=${encodeRFC3986(v)}`).join("&");
-}
-
-function canonical_sorted_raw(paramsObj) {
-  const pairs = buildPairsFrom(paramsObj);
-  pairs.sort((a, b) => a[0].localeCompare(b[0]));
-  return pairs.map(([k, v]) => `${k}=${v}`).join("&");
-}
-
-function canonical_raw(paramsObj) {
-  return paramsObj.toString();
-}
-
-/**
- * verifyProxySignature(req)
- * - Essaie plusieurs canonicals plausibles (query, sorted, encoded, path+query)
- * - Logue tous les essais (pour debug)
- * - Retourne true si match, false sinon
- */
 export function verifyProxySignature(req) {
-  try {
-    const secret = APP_PROXY_SECRET;
-    if (!secret) {
-      console.log("[Proxy HMAC] APP_PROXY_SECRET manquant !");
-      return false;
+  const SECRET = process.env.APP_PROXY_SECRET || "";
+  if (!SECRET) { console.log("[Proxy] SECRET manquant"); return false; }
+
+  const original = req.originalUrl || req.url || "";
+  const pathOnly = original.split("?")[0] || "/prepare";
+  const qs       = original.includes("?") ? original.split("?")[1] : "";
+
+  const pAll = new URLSearchParams(qs);
+  const providedHmac = pAll.get("hmac");
+  const providedSig  = pAll.get("signature"); // legacy
+  if (!providedHmac && !providedSig) {
+    console.log("[Proxy] ni hmac ni signature dans la requête");
+    return false;
+  }
+
+  // on enlève les params de signature pour recalculer
+  pAll.delete("hmac"); pAll.delete("signature");
+
+  // pré-calculs
+  const q_raw    = rawQS(pAll);          // ordre d'origine
+  const q_sraw   = sortRaw(pAll);        // trié non-encodé
+  const q_senc   = sortEncoded(pAll);    // trié encodé
+  const expressP = req.path || pathOnly; // ex: "/prepare"
+  const proxyP   = `/apps/logtek-split${expressP}`; // ex: "/apps/logtek-split/prepare"
+
+  const forms = [
+    // query seule
+    { label:"Q raw",     data:q_raw },
+    { label:"Q sraw",    data:q_sraw },
+    { label:"Q senc",    data:q_senc },
+    // path express
+    { label:"PE raw",    data: q_raw ? `${expressP}?${q_raw}` : expressP },
+    { label:"PE sraw",   data: q_sraw ? `${expressP}?${q_sraw}` : expressP },
+    { label:"PE senc",   data: q_senc ? `${expressP}?${q_senc}` : expressP },
+    // path proxy complet
+    { label:"PP raw",    data: q_raw ? `${proxyP}?${q_raw}` : proxyP },
+    { label:"PP sraw",   data: q_sraw ? `${proxyP}?${q_sraw}` : proxyP },
+    { label:"PP senc",   data: q_senc ? `${proxyP}?${q_senc}` : proxyP },
+  ];
+
+  // 1) cas moderne: HMAC-SHA256 dans "hmac"
+  if (providedHmac) {
+    for (const f of forms) {
+      const digest = crypto.createHmac("sha256", SECRET).update(f.data).digest("hex");
+      const ok = safeEq(digest, providedHmac);
+      console.log(`[Proxy] H256 try=${f.label} | d8=${digest.slice(0,8)} | p8=${providedHmac.slice(0,8)} | ok=${ok}`);
+      if (ok) return true;
     }
+  }
 
-    const original = req.originalUrl || req.url || "";
-    const full = String(original);
-    const queryString = full.includes("?") ? full.split("?")[1] : "";
-    const params = new URLSearchParams(queryString || "");
-    const hmac = params.get("hmac");
-    if (!hmac) {
-      console.log("[Proxy HMAC] pas de param hmac dans la requête");
-      return false;
+  // 2) fallback legacy: "signature" (MD5 de secret + baseString) — rare mais supporté
+  if (providedSig && !providedHmac) {
+    for (const f of forms) {
+      const digest = crypto.createHash("md5").update(SECRET + f.data).digest("hex");
+      const ok = safeEq(digest, providedSig);
+      console.log(`[Proxy] MD5 try=${f.label} | d8=${digest.slice(0,8)} | p8=${providedSig.slice(0,8)} | ok=${ok}`);
+      if (ok) return true;
     }
+  }
 
-    // On enlève hmac pour reconstruire les canonicals
-    params.delete("hmac");
-
-    const shop = params.get("shop") || "";
-    const timestamp = params.get("timestamp") || "";
-    const request_hmac8 = (hmac || "").slice(0, 8);
-
-    const candidates = [];
-
-    // 1) query-only
-    candidates.push({ label: "rawQuery", str: canonical_raw(params) });
-    candidates.push({ label: "sortedRawQuery", str: canonical_sorted_raw(params) });
-    candidates.push({ label: "sortedEncodedQuery", str: canonical_sorted_encoded(params) });
-
-    // 2) path variants
-    const expressPath = (req.path || req.url?.split("?")[0] || "/").toString();
-    const proxyPath = (req.proxyPath || ""); // si tu veux populate req.proxyPath ailleurs
-    const pathCandidates = [
-      { label: "path+rawQuery", prefix: expressPath, body: canonical_raw(params) },
-      { label: "path+sortedRawQuery", prefix: expressPath, body: canonical_sorted_raw(params) },
-      { label: "path+sortedEncodedQuery", prefix: expressPath, body: canonical_sorted_encoded(params) },
-      { label: "proxyPath+rawQuery", prefix: proxyPath || expressPath, body: canonical_raw(params) },
-      { label: "proxyPath+sortedRawQuery", prefix: proxyPath || expressPath, body: canonical_sorted_raw(params) },
-      { label: "proxyPath+sortedEncodedQuery", prefix: proxyPath || expressPath, body: canonical_sorted_encoded(params) },
-    ];
-    for (const c of pathCandidates) {
-      const p = (c.prefix || "").toString();
-      const norm = p.endsWith("/") && p.length > 1 ? p.slice(0, -1) : p;
-      const b = c.body ? (c.body.length ? `${norm}?${c.body}` : `${norm}`) : `${norm}`;
-      candidates.push({ label: c.label, str: b });
-    }
-
-    // 3) original raw QS (ordering & encoding exact)
-    if (queryString) candidates.push({ label: "originalRawQS", str: queryString });
-
-    // Test each candidate
-    for (const c of candidates) {
-      const digest = toHexDigest(secret, c.str);
-      const ok = safeTimingEq(digest, hmac);
-      console.log(`[Proxy HMAC] try=${c.label} | base="${c.str.length>160?c.str.slice(0,160)+'...':c.str}" | digest8=${digest.slice(0,8)} | req8=${request_hmac8} | ok=${ok}`);
-      if (ok) {
-        console.log(`[Proxy HMAC] VALID (${c.label}) shop=${shop} timestamp=${timestamp}`);
-        return true;
-      }
-    }
+  return false;
+}
 
     console.log("[Proxy HMAC] aucun candidat n'a matché -> rejet");
     return false;
