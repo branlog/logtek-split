@@ -34,55 +34,42 @@ const short = (s = "") => (s ? String(s).slice(0, 8) : "");
  */
 function verifyProxySignature(req) {
   try {
-    const original = req.originalUrl || req.url || "";
-    const pathOnly = original.split("?")[0] || req.path || "/prepare";
-    const qs       = original.includes("?") ? original.split("?")[1] : "";
+    const secret = process.env.APP_PROXY_SECRET;
+    const url = new URL(req.originalUrl, `https://${req.headers.host}`);
 
-    const params = new URLSearchParams(qs);
-    const provided = params.get("hmac") || params.get("signature");
-    if (!provided) return false;
-
-    // retirer hmac/signature avant de recalculer
-    params.delete("hmac");
+    // Étape 1 — récupérer les paramètres
+    const params = new URLSearchParams(url.search);
+    const hmac = params.get("signature") || params.get("hmac");
+    if (!hmac) return false;
     params.delete("signature");
+    params.delete("hmac");
 
-    // query triée alphabétiquement
-    const sortedQ = new URLSearchParams(
-      Array.from(params.entries()).sort((a, b) => a[0].localeCompare(b[0]))
-    ).toString();
+    // Étape 2 — trier les paires alphabétiquement
+    const sorted = Array.from(params.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join("&");
 
-    // chemins candidats
-    const expressPath = req.path || pathOnly;                         // "/prepare"
-    const proxyRoot   = `/apps/logtek-split`;                         // racine proxy
-    const proxyPath   = `${proxyRoot}${expressPath}`;                 // "/apps/logtek-split/prepare"
+    // Étape 3 — générer la signature selon Shopify
+    const computed = crypto
+      .createHmac("sha256", secret)
+      .update(sorted)
+      .digest("hex");
 
-    const candidates = [
-      sortedQ ? `${expressPath}?${sortedQ}` : expressPath,
-      sortedQ ? `${proxyPath}?${sortedQ}`   : proxyPath,
-      sortedQ ? `${proxyRoot}?${sortedQ}`   : proxyRoot
-    ];
+    // Étape 4 — comparaison sécurisée
+    const ok = crypto.timingSafeEqual(
+      Buffer.from(computed, "utf8"),
+      Buffer.from(hmac, "utf8")
+    );
 
-    for (const base of candidates) {
-      const digest = crypto.createHmac("sha256", APP_PROXY_SECRET)
-        .update(base)
-        .digest("hex");
-
-      const ok = crypto.timingSafeEqual(
-        Buffer.from(digest, "utf8"),
-        Buffer.from(provided, "utf8")
-      );
-
-      console.log(`[Proxy HMAC] base="${base}" | d8=${short(digest)} | p8=${short(provided)} | ok=${ok}`);
-      if (ok) return true;
-    }
-
-    console.log("[Proxy] aucune variante ne matche → 401");
-    return false;
-  } catch (e) {
-    console.log("[Proxy] exception verify:", e?.message || e);
+    console.log("[Proxy HMAC]", { sorted, computed, hmac, ok });
+    return ok;
+  } catch (err) {
+    console.error("Proxy verification failed:", err);
     return false;
   }
 }
+
 
 // --------------------- Shopify Admin GraphQL helpers ------------------------
 
